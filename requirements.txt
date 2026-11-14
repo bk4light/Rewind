@@ -1,5 +1,5 @@
-streamlit
-google-genai
+streamlit>=1.50
+google-genai>=1.0
 gTTS
-pydantic
+pydantic>=2
 pillow
