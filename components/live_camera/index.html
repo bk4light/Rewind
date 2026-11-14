@@ -83,7 +83,7 @@
   </div>
 
   <div id="status" aria-live="polite">The camera is off.</div>
-  <div id="hint">Orange boxes are people. Teal boxes are things. Press “Look closely” for small items like keys, glasses or pills.</div>
+  <div id="hint">Orange boxes are people. Teal boxes are things. Every few seconds Gemini takes a closer look to find small things like glasses, keys or pills.</div>
 </div>
 
 <!-- In-browser detector: runs on this device, no video leaves the computer. -->
@@ -105,12 +105,20 @@
     value(v) { this.send("streamlit:setComponentValue", { value: v, dataType: "json" }); },
   };
 
-  let args = { ack: 0, room: "" };
+  let args = { ack: 0, room: "", gemini: [], gemini_id: 0, scan_every_ms: 8000 };
+  let geminiObjs = [];   // what Gemini last saw: [{label, state, where, box:[ymin,xmin,ymax,xmax], at}]
+  let geminiSeenId = 0;
   window.addEventListener("message", (e) => {
     const d = e.data;
     if (d && d.type === "streamlit:render") {
       args = Object.assign(args, d.args || {});
       pruneAcked();
+      if (args.gemini_id && args.gemini_id !== geminiSeenId) {
+        geminiSeenId = args.gemini_id;
+        const at = performance.now();
+        geminiObjs = (args.gemini || []).map((g) => Object.assign({ at, alpha: 0 }, g));
+        announceGemini();
+      }
     }
   });
 
@@ -142,9 +150,37 @@
     "dog":        { name: "Dog",        icon: "🐕" },
     "cat":        { name: "Cat",        icon: "🐈" },
   };
+  const EXTRA_ICONS = {
+    glasses: "👓", eyeglasses: "👓", sunglasses: "🕶️", keys: "🔑", key: "🔑", wallet: "👛",
+    "pill bottle": "💊", pills: "💊", medicine: "💊", "pill organizer": "💊", "water bottle": "🧴",
+    mug: "☕", remote: "📺", "hearing aid": "🦻", watch: "⌚", hat: "🧢", shoe: "👟", shoes: "👟",
+    purse: "👜", tablet: "📱", phone: "📱", "cell phone": "📱", book: "📖", plate: "🍽️",
+  };
+  function iconFor(label) {
+    const l = String(label || "").toLowerCase();
+    if (EXTRA_ICONS[l]) return EXTRA_ICONS[l];
+    for (const k of Object.keys(FRIENDLY)) if (FRIENDLY[k].name.toLowerCase() === l) return FRIENDLY[k].icon;
+    for (const k of Object.keys(EXTRA_ICONS)) if (l.includes(k)) return EXTRA_ICONS[k];
+    return "🔹";
+  }
+  // "water bottle" (Gemini) and "bottle" (live detector) are the same kind of thing
+  const SAME = { "water bottle": "bottle", "drink bottle": "bottle", "cell phone": "phone", "mobile phone": "phone",
+    smartphone: "phone", mug: "cup", "coffee mug": "cup", "wine glass": "glass", "tv remote": "remote", "remote control": "remote" };
+  const canon = (n) => { n = String(n || "").toLowerCase().trim(); return SAME[n] || n; };
+  // short state words for labels
+  function shortState(state) {
+    const s = String(state || "").toLowerCase();
+    if (s.includes("hand")) return "in hand";
+    if (s.includes("worn")) return "being worn";
+    if (s.includes("floor")) return "on the floor";
+    if (s.includes("surface") || s.includes("table") || s.includes("counter")) return "on a surface";
+    return "";
+  }
   // Furniture, cars etc. are ignored on purpose: fewer boxes = less confusion.
 
-  const MIN_SCORE = 0.5;
+  const MIN_SCORE = 0.3;        // ask the detector for more candidates...
+  const PERSON_SCORE = 0.55;    // ...but people must be clear
+  const OBJECT_SCORE = 0.35;    // small things (bottles, cups, phones) get a lower bar
   const CONFIRM_HITS = 3;     // must be seen in 3 detections before a box appears (stops flicker)
   const LOST_AFTER_MS = 2500; // keep the box a moment after it disappears
   const PLACED_AFTER_MS = 3000; // item sits still this long -> "put down here"
@@ -176,6 +212,32 @@
   let latestSnap = null;
   let latestSnapAt = 0;
   const lastSpoken = {};
+  let lastAutoId = 0, lastAutoAt = 0;
+  function maybeAutoLook() {
+    if (!running || document.hidden) return;
+    const every = Number(args.scan_every_ms || 8000);
+    if (every <= 0) return;
+    const now = Date.now();
+    const waiting = lastAutoId && Number(args.ack || 0) < lastAutoId; // previous look not answered yet
+    if (now - lastAutoAt < every || (waiting && now - lastAutoAt < 25000)) return;
+    const snap = takeSnapshot();
+    if (!snap) return;
+    lastAutoAt = now;
+    pushEvent({ type: "auto", label: "Room", snapshot: snap });
+    lastAutoId = eventSeq;
+  }
+  setInterval(maybeAutoLook, 1000);
+
+  const spokenGemini = {};
+  function announceGemini() {
+    for (const g of geminiObjs) {
+      const st = shortState(g.state);
+      const key = (g.label + "|" + st).toLowerCase();
+      if (spokenGemini[key]) continue;
+      spokenGemini[key] = true;
+      speak(st ? `${g.label}, ${st}` : g.label, "g:" + key);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -396,6 +458,22 @@
     const placed = []; // label rectangles already drawn, so labels never cover each other
     const hits = (r) => placed.some((q) => r.x < q.x + q.w && r.x + r.w > q.x && r.y < q.y + q.h && r.y + r.h > q.y);
     const order = tracks.slice().sort((a, b) => (a.cls === "person" ? 0 : 1) - (b.cls === "person" ? 0 : 1));
+    // Gemini boxes (0-1000 coords) converted to video pixels
+    const nowP = performance.now();
+    const W = video.videoWidth, H = video.videoHeight;
+    const gBoxes = geminiObjs
+      .filter((g) => Array.isArray(g.box) && g.box.length === 4 && nowP - g.at < 20000)
+      .map((g) => {
+        const [y1, x1, y2, x2] = g.box;
+        return Object.assign(g, { px: [x1 / 1000 * W, y1 / 1000 * H, (x2 - x1) / 1000 * W, (y2 - y1) / 1000 * H] });
+      });
+    // give COCO tracks Gemini's "in hand / on a surface" when they overlap the same thing
+    for (const t of tracks) {
+      t.gState = "";
+      if (t.cls === "person" || !t.confirmed) continue;
+      const m = gBoxes.find((g) => iou(g.px, t.raw) > 0.2);
+      if (m) { t.gState = shortState(m.state); m.mergedWith = t.id; } else for (const g of gBoxes) if (g.mergedWith === t.id) g.mergedWith = 0;
+    }
     for (const t of order) {
       if (!t.confirmed) continue;
       t.alpha += ((t.gone ? 0 : 1) - t.alpha) * 0.18; // gentle fade
@@ -414,7 +492,8 @@
 
       // label pill
       const f = friendly(t.cls);
-      const text = `${f.icon} ${f.name}${t.held ? " · in hand" : ""}`;
+      const stateWord = t.held ? "in hand" : (t.gState || "");
+      const text = `${f.icon} ${f.name}${stateWord ? " · " + stateWord : ""}`;
       ctx.font = `700 ${fontPx}px Inter, -apple-system, "Segoe UI", sans-serif`;
       const tw = ctx.measureText(text).width;
       const ph = fontPx + 16, pw = tw + 24;
@@ -435,18 +514,67 @@
       ctx.fillText(text, px + 12, py + ph / 2 + 1);
       ctx.globalAlpha = 1;
     }
+
+    // Things only Gemini found (glasses, keys, pills…) — same calm style, slightly thinner line
+    const liveKinds = new Set(tracks.filter((t) => t.confirmed && !t.gone).map((t) => canon(friendly(t.cls).name)));
+    for (const g of gBoxes) {
+      if (g.mergedWith || /^(person|man|woman|people|child)$/i.test(g.label)) continue;
+      if (liveKinds.has(canon(g.label))) { g.hidden = true; continue; } // the moving box is fresher
+      g.hidden = false;
+      const age = nowP - g.at;
+      const target = age < 16000 ? 1 : 0;
+      g.alpha += (target - g.alpha) * 0.15;
+      if (g.alpha < 0.02) continue;
+      const [bx, by, bw, bh] = g.px;
+      const x = ox + bx * s, y = oy + by * s, w = bw * s, h = bh * s;
+      const color = "#0F5E6B";
+      ctx.globalAlpha = g.alpha;
+      roundRectPath(x, y, w, h, 14);
+      ctx.lineWidth = line + 4; ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.stroke();
+      ctx.lineWidth = Math.max(3, line - 1); ctx.strokeStyle = color; ctx.stroke();
+      const st = shortState(g.state);
+      const text = `${iconFor(g.label)} ${g.label.charAt(0).toUpperCase() + g.label.slice(1)}${st ? " · " + st : ""}`;
+      ctx.font = `700 ${fontPx}px Inter, -apple-system, "Segoe UI", sans-serif`;
+      const tw = ctx.measureText(text).width;
+      const ph = fontPx + 16, pw = tw + 24;
+      const px = Math.max(ox + 4, Math.min(x, ox + video.videoWidth * s - pw - 4));
+      const minY = oy + 4, maxY = oy + video.videoHeight * s - ph - 4;
+      const tries = [y - ph - 8, y + h + 8, y + 8].map((v) => Math.max(minY, Math.min(maxY, v)));
+      let py = tries.find((v) => !hits({ x: px, y: v, w: pw, h: ph }));
+      if (py === undefined) { py = tries[0]; while (hits({ x: px, y: py, w: pw, h: ph }) && py < maxY) py += ph + 6; }
+      placed.push({ x: px, y: py, w: pw, h: ph });
+      roundRectPath(px, py, pw, ph, 12);
+      ctx.fillStyle = color; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = "#FFFFFF"; ctx.stroke();
+      ctx.fillStyle = "#FFFFFF"; ctx.textBaseline = "middle";
+      ctx.fillText(text, px + 12, py + ph / 2 + 1);
+      ctx.globalAlpha = 1;
+    }
   }
 
   function updateStatus() {
     if (!running) return;
     const vis = tracks.filter((t) => t.confirmed && !t.gone);
-    if (!vis.length) { statusEl.textContent = "Looking… I don’t see anyone or anything I know yet."; return; }
+    const nowP = performance.now();
+    const gOnly = geminiObjs.filter((g) => !g.mergedWith && !g.hidden && nowP - g.at < 16000 && !/^(person|man|woman|people|child)$/i.test(g.label));
+    if (!vis.length && !gOnly.length) { statusEl.textContent = "Looking… I don’t see anyone or anything I know yet."; return; }
     const counts = {};
     vis.forEach((t) => {
-      const n = friendly(t.cls).name.toLowerCase() + (t.held ? " (in hand)" : "");
+      const st = t.held ? "in hand" : (t.gState || "");
+      const n = friendly(t.cls).name.toLowerCase() + (st ? ` (${st})` : "");
       counts[n] = (counts[n] || 0) + 1;
     });
-    const parts = Object.entries(counts).map(([n, c]) => (c > 1 ? `${c} × ${n}` : `a ${n}`.replace(/^a ([aeiou])/i, "an $1")));
+    gOnly.forEach((g) => {
+      const st = shortState(g.state);
+      const n = String(g.label).toLowerCase() + (st ? ` (${st})` : "");
+      counts[n] = (counts[n] || 0) + 1;
+    });
+    const PLURAL = /^(glasses|eyeglasses|sunglasses|reading glasses|keys|car keys|pills|scissors|shoes|earrings|headphones)\b/i;
+    const parts = Object.entries(counts).map(([n, c]) => {
+      if (c > 1) return `${c} × ${n}`;
+      if (PLURAL.test(n)) return n;
+      return `a ${n}`.replace(/^a ([aeiou])/i, "an $1");
+    });
     statusEl.textContent = "I can see: " + parts.join(", ") + ".";
   }
 
@@ -460,7 +588,7 @@
     try {
       if (Date.now() - latestSnapAt > 1500) { latestSnap = takeSnapshot(); latestSnapAt = Date.now(); }
       const preds = await model.detect(video, 20, MIN_SCORE);
-      const dets = preds.filter((p) => FRIENDLY[p.class]);
+      const dets = preds.filter((p) => FRIENDLY[p.class] && p.score >= (p.class === "person" ? PERSON_SCORE : OBJECT_SCORE));
       updateTracks(dets, now);
     } catch (err) {
       console.error(err);
@@ -528,7 +656,8 @@
   lookBtn.addEventListener("click", () => {
     const snap = takeSnapshot();
     if (!snap) return;
-    pushEvent({ type: "scan", label: "Room", snapshot: snap });
+    pushEvent({ type: "auto", label: "Room", snapshot: snap, manual: true });
+    lastAutoAt = Date.now(); lastAutoId = eventSeq;
     statusEl.textContent = "Taking a closer look with Gemini…";
     flush();
   });
@@ -543,4 +672,3 @@
 </script>
 </body>
 </html>
-
