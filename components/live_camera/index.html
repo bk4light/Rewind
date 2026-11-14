@@ -1,1 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Rewind live camera</title>
+<style>
+  /*
+   * Dementia-friendly design choices:
+   *  - Large text (22px+), plain words, one clear action per button.
+   *  - High luminance contrast; warm off-white background (less glare).
+   *  - Two calm, very different box colours: terracotta for PEOPLE, deep teal for THINGS.
+   *    (Orange vs teal stays distinguishable for older eyes, where blue/green and
+   *    blue/purple discrimination often fades.) No red = no "alarm" feeling.
+   *  - Every box has a white halo so it shows on dark AND light rooms.
+   *  - Each label has an icon + a word (two ways to recognise it).
+   *  - Nothing flashes: boxes fade in/out gently and only appear after a few steady frames.
+   */
+  :root {
+    --bg: #F6F3EC;
+    --card: #FFFFFF;
+    --ink: #18222F;
+    --muted: #4A5868;
+    --line: #D8D1C5;
+    --teal: #0F5E6B;
+    --teal-dark: #0B4652;
+    --terracotta: #A8471A;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #wrap { padding: 4px 2px 8px; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  button {
+    font: inherit; font-size: 21px; font-weight: 650; line-height: 1.2;
+    border-radius: 14px; padding: 14px 20px; cursor: pointer;
+    border: 2px solid var(--teal); background: var(--card); color: var(--teal-dark);
+    min-height: 58px;
+  }
+  button.primary { background: var(--teal); color: #fff; flex: 1 1 220px; }
+  button.primary:hover { background: var(--teal-dark); }
+  button:focus-visible { outline: 4px solid #E0A458; outline-offset: 2px; }
+  button[disabled] { opacity: 0.45; cursor: default; }
+
+  #stage {
+    position: relative; width: 100%; aspect-ratio: 4 / 3;
+    background: #2A3340; border-radius: 18px; overflow: hidden;
+    border: 3px solid var(--line);
+  }
+  #video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #video { object-fit: contain; }
+  #placeholder {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    color: #F6F3EC; font-size: 24px; line-height: 1.5; padding: 24px;
+  }
+  #placeholder .big { font-size: 56px; margin-bottom: 8px; }
+
+  #status {
+    margin-top: 12px; background: var(--card); border: 2px solid var(--line);
+    border-left: 8px solid var(--teal); border-radius: 14px;
+    padding: 14px 18px; font-size: 24px; font-weight: 600; line-height: 1.4;
+  }
+  #hint { margin-top: 8px; font-size: 17px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="controls">
+    <button id="startBtn" class="primary">▶ Start camera</button>
+    <button id="voiceBtn" aria-pressed="true">🔊 Voice: ON</button>
+    <button id="lookBtn" disabled>🔍 Look closely</button>
+  </div>
+
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="placeholder">
+      <div class="big">📷</div>
+      <div>Press <b>Start camera</b>.<br/>I will name the people and things I see.</div>
+    </div>
+  </div>
+
+  <div id="status" aria-live="polite">The camera is off.</div>
+  <div id="hint">Orange boxes are people. Teal boxes are things. Press “Look closely” for small items like keys, glasses or pills.</div>
+</div>
+
+<!-- In-browser detector: runs on this device, no video leaves the computer. -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------------
+  // Minimal Streamlit component protocol (no build step needed)
+  // ---------------------------------------------------------------------------
+  const ST = {
+    send(type, data) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*");
+    },
+    ready() { this.send("streamlit:componentReady", { apiVersion: 1 }); },
+    height(h) { this.send("streamlit:setFrameHeight", { height: Math.ceil(h) }); },
+    value(v) { this.send("streamlit:setComponentValue", { value: v, dataType: "json" }); },
+  };
+
+  let args = { ack: 0, room: "" };
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (d && d.type === "streamlit:render") {
+      args = Object.assign(args, d.args || {});
+      pruneAcked();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // What we look for, and the plain words we use for it
+  // ---------------------------------------------------------------------------
+  const FRIENDLY = {
+    "person":     { name: "Person",     icon: "🧑" },
+    "bottle":     { name: "Bottle",     icon: "🧴" },
+    "cup":        { name: "Cup",        icon: "☕" },
+    "wine glass": { name: "Glass",      icon: "🥛" },
+    "cell phone": { name: "Phone",      icon: "📱" },
+    "remote":     { name: "TV remote",  icon: "📺" },
+    "book":       { name: "Book",       icon: "📖" },
+    "laptop":     { name: "Laptop",     icon: "💻" },
+    "handbag":    { name: "Handbag",    icon: "👜" },
+    "backpack":   { name: "Backpack",   icon: "🎒" },
+    "umbrella":   { name: "Umbrella",   icon: "☂️" },
+    "scissors":   { name: "Scissors",   icon: "✂️" },
+    "toothbrush": { name: "Toothbrush", icon: "🪥" },
+    "bowl":       { name: "Bowl",       icon: "🥣" },
+    "spoon":      { name: "Spoon",      icon: "🥄" },
+    "fork":       { name: "Fork",       icon: "🍴" },
+    "clock":      { name: "Clock",      icon: "🕰️" },
+    "teddy bear": { name: "Teddy bear", icon: "🧸" },
+    "banana":     { name: "Banana",     icon: "🍌" },
+    "apple":      { name: "Apple",      icon: "🍎" },
+    "orange":     { name: "Orange",     icon: "🍊" },
+    "dog":        { name: "Dog",        icon: "🐕" },
+    "cat":        { name: "Cat",        icon: "🐈" },
+  };
+  // Furniture, cars etc. are ignored on purpose: fewer boxes = less confusion.
+
+  const MIN_SCORE = 0.5;
+  const CONFIRM_HITS = 3;     // must be seen in 3 detections before a box appears (stops flicker)
+  const LOST_AFTER_MS = 2500; // keep the box a moment after it disappears
+  const PLACED_AFTER_MS = 3000; // item sits still this long -> "put down here"
+  const SPEAK_COOLDOWN_MS = 20000;
+
+  // ---------------------------------------------------------------------------
+  // DOM
+  // ---------------------------------------------------------------------------
+  const video = document.getElementById("video");
+  const overlay = document.getElementById("overlay");
+  const ctx = overlay.getContext("2d");
+  const placeholder = document.getElementById("placeholder");
+  const statusEl = document.getElementById("status");
+  const startBtn = document.getElementById("startBtn");
+  const voiceBtn = document.getElementById("voiceBtn");
+  const lookBtn = document.getElementById("lookBtn");
+  const snapCanvas = document.createElement("canvas");
+
+  let model = null;
+  let stream = null;
+  let running = false;
+  let voiceOn = true;
+  let tracks = [];
+  let nextTrackId = 1;
+  let eventSeq = Date.now(); // unique across page reloads
+  let events = [];
+  let dirty = false;
+  let lastVisibleKey = "";
+  let latestSnap = null;
+  let latestSnapAt = 0;
+  const lastSpoken = {};
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+  const friendly = (cls) => FRIENDLY[cls] || { name: cls, icon: "•" };
+  const area = (b) => Math.max(0, b[2]) * Math.max(0, b[3]);
+  function intersect(a, b) {
+    const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+    const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+    return Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  }
+  function iou(a, b) {
+    const i = intersect(a, b);
+    const u = area(a) + area(b) - i;
+    return u > 0 ? i / u : 0;
+  }
+  const center = (b) => [b[0] + b[2] / 2, b[1] + b[3] / 2];
+  function centerDistRel(a, b) {
+    const [ax, ay] = center(a), [bx, by] = center(b);
+    return Math.hypot(ax - bx, ay - by) / Math.max(a[2], a[3], 1);
+  }
+  function toBox1000(b) {
+    const W = video.videoWidth || 1, H = video.videoHeight || 1;
+    const c = (v) => Math.round(Math.max(0, Math.min(1000, v)));
+    return [c(b[1] / H * 1000), c(b[0] / W * 1000), c((b[1] + b[3]) / H * 1000), c((b[0] + b[2]) / W * 1000)];
+  }
+  function positionWords(b) {
+    const W = video.videoWidth || 1, H = video.videoHeight || 1;
+    const [cx, cy] = center(b);
+    const h = cx < W / 3 ? "left" : cx > (2 * W) / 3 ? "right" : "middle";
+    const v = cy < H / 3 ? "top" : cy > (2 * H) / 3 ? "bottom" : "";
+    if (h === "middle" && !v) return "in the middle of the view";
+    if (h === "middle") return `at the ${v} of the view`;
+    return v ? `at the ${v} ${h} of the view` : `on the ${h} side of the view`;
+  }
+  const clockTime = () => new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+  function takeSnapshot() {
+    if (!video.videoWidth) return null;
+    const scale = Math.min(1, 768 / video.videoWidth);
+    snapCanvas.width = Math.round(video.videoWidth * scale);
+    snapCanvas.height = Math.round(video.videoHeight * scale);
+    snapCanvas.getContext("2d").drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+    return snapCanvas.toDataURL("image/jpeg", 0.72);
+  }
+
+  function speak(text, key) {
+    if (!voiceOn || !("speechSynthesis" in window)) return;
+    const now = Date.now();
+    if (key && lastSpoken[key] && now - lastSpoken[key] < SPEAK_COOLDOWN_MS) return;
+    if (key) lastSpoken[key] = now;
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.85; // slower speech is easier to follow
+    u.pitch = 1.0;
+    window.speechSynthesis.speak(u);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Events sent back to Python
+  // ---------------------------------------------------------------------------
+  function pushEvent(ev) {
+    ev.id = ++eventSeq;
+    ev.time_label = clockTime();
+    ev.room = args.room || "";
+    events.push(ev);
+    // keep payload small: only the newest few keep their photo
+    events = events.slice(-12);
+    events.forEach((e, i) => { if (i < events.length - 4) delete e.snapshot; });
+    dirty = true;
+  }
+  function pruneAcked() {
+    const ack = Number(args.ack || 0);
+    if (ack) events = events.filter((e) => e.id > ack);
+  }
+  function visibleSummary() {
+    return tracks
+      .filter((t) => t.confirmed && !t.gone)
+      .map((t) => ({ label: friendly(t.cls).name, held: !!t.held }));
+  }
+  function flush() {
+    const vis = visibleSummary();
+    const key = vis.map((v) => v.label + (v.held ? "*" : "")).sort().join("|");
+    if (key !== lastVisibleKey) { lastVisibleKey = key; dirty = true; }
+    if (!dirty) return;
+    dirty = false;
+    ST.value({ events, visible: vis, camera_on: running, sent_at: Date.now() });
+  }
+  setInterval(flush, 800);
+
+  // ---------------------------------------------------------------------------
+  // Tracker: keeps the same box on the same object between frames
+  // ---------------------------------------------------------------------------
+  function updateTracks(dets, now) {
+    const used = new Set();
+    // Match existing tracks to new detections (same class, best overlap / nearest)
+    tracks.sort((a, b) => b.hits - a.hits);
+    for (const t of tracks) {
+      let best = -1, bestScore = 0;
+      dets.forEach((d, i) => {
+        if (used.has(i) || d.class !== t.cls) return;
+        const o = iou(t.raw, d.bbox);
+        const near = centerDistRel(t.raw, d.bbox) < 0.75 ? 0.05 : 0;
+        const s = Math.max(o, near);
+        if (s > bestScore) { bestScore = s; best = i; }
+      });
+      if (best >= 0) {
+        used.add(best);
+        const d = dets[best];
+        t.raw = d.bbox.slice();
+        // smooth the box so it glides instead of jittering
+        t.box = t.box.map((v, k) => v * 0.55 + d.bbox[k] * 0.45);
+        t.hits += 1; t.miss = 0; t.lastSeen = now; t.gone = false;
+        // has it moved since it settled?
+        if (centerDistRel(t.anchor, d.bbox) > 0.35) {
+          t.anchor = d.bbox.slice(); t.stillSince = now; t.placedReported = false;
+        }
+      }
+    }
+    dets.forEach((d, i) => {
+      if (used.has(i)) return;
+      tracks.push({
+        id: nextTrackId++, cls: d.class, raw: d.bbox.slice(), box: d.bbox.slice(), anchor: d.bbox.slice(),
+        hits: 1, miss: 0, firstSeen: now, lastSeen: now, stillSince: now,
+        confirmed: false, held: false, heldVotes: 0, placedReported: false,
+        alpha: 0, gone: false, snap: null,
+      });
+    });
+
+    const people = tracks.filter((t) => t.cls === "person" && t.lastSeen === now);
+
+    for (const t of tracks) {
+      if (t.lastSeen !== now) t.miss += 1;
+
+      // Confirm (show) only after a few steady detections
+      if (!t.confirmed && t.hits >= CONFIRM_HITS) {
+        t.confirmed = true;
+        const f = friendly(t.cls);
+        speak(f.name, t.cls);
+        if (t.cls === "person") pushEvent({ type: "arrived", label: f.name });
+      }
+
+      // "In hand": a thing that sits mostly inside a person's box
+      if (t.cls !== "person" && t.lastSeen === now) {
+        const insidePerson = people.some((p) => intersect(t.raw, p.raw) / Math.max(1, area(t.raw)) > 0.6
+                                              && area(t.raw) < 0.5 * area(p.raw));
+        t.heldVotes = Math.max(-3, Math.min(3, t.heldVotes + (insidePerson ? 1 : -1)));
+        const wasHeld = t.held;
+        if (t.heldVotes >= 2) t.held = true;
+        if (t.heldVotes <= -2) t.held = false;
+        if (t.held) { t.stillSince = now; t.anchor = t.raw.slice(); t.placedReported = false; }
+        if (t.confirmed && t.held && !wasHeld) speak(`${friendly(t.cls).name} in hand`, t.cls + ":held");
+      }
+
+      // Remember a photo of the item while we can see it (for "last seen" later)
+      if (t.confirmed && t.cls !== "person" && t.lastSeen === now && latestSnap) t.snap = latestSnap;
+
+      // "Put down here": not held, sat still for a few seconds
+      if (t.confirmed && t.cls !== "person" && !t.held && !t.placedReported
+          && t.lastSeen === now && now - t.stillSince > PLACED_AFTER_MS) {
+        t.placedReported = true;
+        pushEvent({
+          type: "placed", label: friendly(t.cls).name, coco: t.cls,
+          box: toBox1000(t.raw), position: positionWords(t.raw), snapshot: takeSnapshot(),
+        });
+      }
+
+      // Lost from view
+      if (now - t.lastSeen > LOST_AFTER_MS) {
+        t.gone = true;
+        if (t.confirmed && !t.reportedGone) {
+          t.reportedGone = true;
+          if (t.cls === "person") {
+            pushEvent({ type: "left", label: "Person" });
+          } else if (!t.placedReported && !tracks.some((o) => o !== t && o.cls === t.cls && !o.gone && now - o.lastSeen < 500)) {
+            // It moved or was carried away before settling - record where we last saw it
+            pushEvent({
+              type: "lost", label: friendly(t.cls).name, coco: t.cls, held: t.held,
+              box: toBox1000(t.raw), position: positionWords(t.raw), snapshot: t.snap,
+            });
+          }
+        }
+      }
+    }
+    // drop faded-out tracks and unconfirmed noise
+    tracks = tracks.filter((t) => !(t.gone && t.alpha <= 0.01) && !(!t.confirmed && t.miss > 4));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drawing
+  // ---------------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = overlay.clientWidth, ch = overlay.clientHeight;
+    if (overlay.width !== Math.round(cw * dpr) || overlay.height !== Math.round(ch * dpr)) {
+      overlay.width = Math.round(cw * dpr); overlay.height = Math.round(ch * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    if (!video.videoWidth) return;
+
+    // video is drawn with object-fit: contain -> compute the letterbox
+    const s = Math.min(cw / video.videoWidth, ch / video.videoHeight);
+    const ox = (cw - video.videoWidth * s) / 2, oy = (ch - video.videoHeight * s) / 2;
+    const fontPx = Math.max(20, Math.min(32, cw * 0.04));
+    const line = Math.max(5, cw * 0.008);
+
+    const placed = []; // label rectangles already drawn, so labels never cover each other
+    const hits = (r) => placed.some((q) => r.x < q.x + q.w && r.x + r.w > q.x && r.y < q.y + q.h && r.y + r.h > q.y);
+    const order = tracks.slice().sort((a, b) => (a.cls === "person" ? 0 : 1) - (b.cls === "person" ? 0 : 1));
+    for (const t of order) {
+      if (!t.confirmed) continue;
+      t.alpha += ((t.gone ? 0 : 1) - t.alpha) * 0.18; // gentle fade
+      if (t.alpha < 0.02) continue;
+
+      const isPerson = t.cls === "person";
+      const color = isPerson ? "#A8471A" : "#0F5E6B";
+      const [bx, by, bw, bh] = t.box;
+      const x = ox + bx * s, y = oy + by * s, w = bw * s, h = bh * s;
+
+      ctx.globalAlpha = t.alpha;
+      // white halo then colour line
+      roundRectPath(x, y, w, h, 14);
+      ctx.lineWidth = line + 6; ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.stroke();
+      ctx.lineWidth = line; ctx.strokeStyle = color; ctx.stroke();
+
+      // label pill
+      const f = friendly(t.cls);
+      const text = `${f.icon} ${f.name}${t.held ? " · in hand" : ""}`;
+      ctx.font = `700 ${fontPx}px Inter, -apple-system, "Segoe UI", sans-serif`;
+      const tw = ctx.measureText(text).width;
+      const ph = fontPx + 16, pw = tw + 24;
+      const px = Math.max(ox + 4, Math.min(x, ox + video.videoWidth * s - pw - 4));
+      const minY = oy + 4, maxY = oy + video.videoHeight * s - ph - 4;
+      // try: above the box, below the box, inside the top; then nudge down until free
+      const tries = [y - ph - 8, y + h + 8, y + 8].map((v) => Math.max(minY, Math.min(maxY, v)));
+      let py = tries.find((v) => !hits({ x: px, y: v, w: pw, h: ph }));
+      if (py === undefined) {
+        py = tries[0];
+        while (hits({ x: px, y: py, w: pw, h: ph }) && py < maxY) py += ph + 6;
+      }
+      placed.push({ x: px, y: py, w: pw, h: ph });
+      roundRectPath(px, py, pw, ph, 12);
+      ctx.fillStyle = color; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = "#FFFFFF"; ctx.stroke();
+      ctx.fillStyle = "#FFFFFF"; ctx.textBaseline = "middle";
+      ctx.fillText(text, px + 12, py + ph / 2 + 1);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function updateStatus() {
+    if (!running) return;
+    const vis = tracks.filter((t) => t.confirmed && !t.gone);
+    if (!vis.length) { statusEl.textContent = "Looking… I don’t see anyone or anything I know yet."; return; }
+    const counts = {};
+    vis.forEach((t) => {
+      const n = friendly(t.cls).name.toLowerCase() + (t.held ? " (in hand)" : "");
+      counts[n] = (counts[n] || 0) + 1;
+    });
+    const parts = Object.entries(counts).map(([n, c]) => (c > 1 ? `${c} × ${n}` : `a ${n}`.replace(/^a ([aeiou])/i, "an $1")));
+    statusEl.textContent = "I can see: " + parts.join(", ") + ".";
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------------
+  async function loop() {
+    if (!running) return;
+    if (document.hidden || video.readyState < 2) { requestAnimationFrame(loop); return; }
+    const now = performance.now();
+    try {
+      if (Date.now() - latestSnapAt > 1500) { latestSnap = takeSnapshot(); latestSnapAt = Date.now(); }
+      const preds = await model.detect(video, 20, MIN_SCORE);
+      const dets = preds.filter((p) => FRIENDLY[p.class]);
+      updateTracks(dets, now);
+    } catch (err) {
+      console.error(err);
+    }
+    draw();
+    updateStatus();
+    requestAnimationFrame(loop);
+  }
+  // keep fading boxes smooth even between slow detections
+  (function paint() { if (running) draw(); requestAnimationFrame(paint); })();
+
+  async function start() {
+    startBtn.disabled = true;
+    try {
+      statusEl.textContent = "Starting the camera…";
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      if (video.videoWidth) document.getElementById("stage").style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+      placeholder.style.display = "none";
+      if (!model) {
+        statusEl.textContent = "Getting ready to recognise things… (first time takes a few seconds)";
+        model = await cocoSsd.load({ base: "mobilenet_v2" });
+      }
+      running = true;
+      startBtn.textContent = "Pause camera";
+      startBtn.disabled = false;
+      lookBtn.disabled = false;
+      speak("Camera on. I will tell you what I see.");
+      dirty = true;
+      loop();
+    } catch (err) {
+      console.error(err);
+      startBtn.disabled = false;
+      statusEl.textContent = err && err.name === "NotAllowedError"
+        ? "I need permission to use the camera. Please allow the camera in the browser and press Start again."
+        : "The camera could not start. Check it is plugged in and not used by another app.";
+    }
+  }
+
+  function stop() {
+    running = false;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    video.srcObject = null;
+    tracks = [];
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    placeholder.style.display = "flex";
+    startBtn.textContent = "▶ Start camera";
+    lookBtn.disabled = true;
+    statusEl.textContent = "The camera is paused.";
+    dirty = true;
+  }
+
+  startBtn.addEventListener("click", () => (running ? stop() : start()));
+  voiceBtn.addEventListener("click", () => {
+    voiceOn = !voiceOn;
+    voiceBtn.textContent = voiceOn ? "🔊 Voice: ON" : "🔇 Voice: OFF";
+    voiceBtn.setAttribute("aria-pressed", String(voiceOn));
+    if (!voiceOn && "speechSynthesis" in window) window.speechSynthesis.cancel();
+  });
+  lookBtn.addEventListener("click", () => {
+    const snap = takeSnapshot();
+    if (!snap) return;
+    pushEvent({ type: "scan", label: "Room", snapshot: snap });
+    statusEl.textContent = "Taking a closer look with Gemini…";
+    flush();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------------------
+  new ResizeObserver(() => ST.height(document.body.scrollHeight + 4)).observe(document.body);
+  ST.ready();
+  ST.height(document.body.scrollHeight + 4);
+})();
+</script>
+</body>
+</html>
 
