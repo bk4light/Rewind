@@ -1,54 +1,62 @@
-# Rewind 🧭
+# Rewind 🧭: a calm memory companion for people living with dementia
 
-A calm, live "memory camera" for people living with Alzheimer's and dementia.
-Point a camera at the room and Rewind **boxes and names people and things in real time**
-("Person", "Bottle · in hand"), says them out loud, and **remembers where things were put down**,
-so later you can ask *"Where is my bottle?"* and hear a short, kind answer.
+**Built with the Google Gemini API** · developed and hosted in **Coder** · Emory Hacks 2026
 
-## How it works
+Rewind is a gentle helper for someone living with Alzheimer's or dementia. It greets them by name and reminds them they are safe at home. A live camera keeps track of everyday things (*"Glasses · on the table"*, *"Bottle · in hand"*), so they can ask *"Where are my glasses?"* and hear a short, kind answer. It also tracks pills, announces appointments with a chime and a calm voice, and has one big button to call a family member.
 
-| Part | What it does | Where it runs |
+---
+
+## ✨ How we use Gemini
+
+Gemini is the "understanding" layer of Rewind. Every Gemini call is in [`app.py`](app.py) and goes through one helper, `gemini()`.
+
+| Feature | What Gemini does | Gemini features used |
 |---|---|---|
-| Live detector (`components/live_camera/`) | TensorFlow.js COCO-SSD finds people, bottles, cups, phones, remotes, books, glasses… ~10–20 times a second, tracks each one, and works out "in hand", "put down" and "went out of view" | In the browser, on the user's device (no video is uploaded) |
-| Gemini (`app.py`) | When an item is put down, one still photo goes to Gemini, which describes the place in human words ("on the kitchen counter, next to the sink"). **Look closely** asks Gemini to find small things the live model can't (keys, glasses, pills). Gemini also answers questions. | Streamlit server |
-| Memory panel | RIGHT NOW · LAST SEEN · WHAT HAPPENED, kept only in the browser session | Streamlit |
+| **Camera look-ins** (`look_at_scene`) | Looks at one still photo from the live camera and returns each person and item, whether it's **in someone's hand, on a surface, being worn or on the floor**, a short place label (*"on the couch"*), a landmark description (*"on the coffee table, next to the lamp"*) and a bounding box | Multimodal **image understanding** + **structured JSON output** (`response_schema=SceneAnalysis`) + **spatial bounding boxes** |
+| **Ask Rewind** (`answer_spatial_question`) | Answers *"Where is my bottle?"*, *"Did I take my pills?"* or *"What's next today?"* using the **current camera image**, the memory log and the pill/reminder schedule, in 1–2 warm sentences (then read aloud) | Multimodal reasoning over image + text context |
+| **Reminders in your own words** (`parse_reminder`) | Turns *"dentist with Dr. Lee next Tuesday at 2"* into a real reminder: date, time, repeat, early warning, a spoken message and a confirmation | **Structured output** (`response_schema=ParsedReminder`) + date/time reasoning |
+| **Look closely / photo upload** | Finds small items that the on-device detector can't (keys, glasses, pills, wallet, hearing aid) and draws them on the photo | Image understanding + bounding boxes |
 
-### Dementia-friendly design
-- Large text (19–32px), plain words, one action per button, a large clock with day and date.
-- Warm off-white background (less glare) and dark charcoal text for high contrast.
-- Only **two** box colours, chosen to stay easy to tell apart for older eyes: **terracotta = people**, **deep teal = things**. No red (it feels like an alarm).
-- Every box has a white halo, so it shows up in both dark and bright rooms. Each label has an icon and a word.
-- **Nothing flashes**: a box only appears after the item has been seen for a few frames, then fades in and out gently.
-- Slow, short spoken phrases, with a cooldown so the same thing isn't repeated. One tap turns the voice off.
-- Answers say the place first, then the time, and never blame the person.
+**Built to be reliable and free-tier friendly:**
+- **Automatic model fallback:** `gemini-3.5-flash-lite → gemini-3.1-flash-lite → gemini-3.8-flash → gemini-3.6-flash`. If a model hits its quota, Rewind quietly switches to the next one, so the person never sees an error.
+- **Event-driven calls:** a fast on-device detector (TensorFlow.js) watches the video, and Rewind only asks Gemini to look **when something changes** (an item is picked up or put down, someone arrives), plus a slow heartbeat. That's about 3–8 calls a minute instead of a constant stream.
+- **Graceful offline mode:** if Gemini is unavailable, Ask still answers from memory and reminders still parse with a simple backup parser.
+- **Privacy:** the API key stays on the server (never in the browser or in git), video is never uploaded (only an occasional still photo), and memory notes are erased when the tab closes.
 
-## Run it
+## 🏗 How it works
 
-### In Coder (recommended for the hackathon)
-1. Create a workspace from this repo (the `.devcontainer/` installs Python deps + the Entire CLI).
-2. Add your key: `mkdir -p .streamlit && echo 'GEMINI_API_KEY = "YOUR_KEY"' > .streamlit/secrets.toml`
-   (or set `GEMINI_API_KEY` as a workspace environment variable).
-3. `streamlit run app.py`
-4. Open port **8501** from the Coder dashboard (or `coder port-forward <workspace> --tcp 8501` and visit `http://localhost:8501`).
-   The camera only works over **https** or **localhost**, and both of these are.
-
-### Locally
-```bash
-pip install -r requirements.txt
-echo 'GEMINI_API_KEY = "YOUR_KEY"' > .streamlit/secrets.toml
-streamlit run app.py
+```
+Browser (on the user's device)                   Streamlit server (in a Coder workspace)
+───────────────────────────────                  ───────────────────────────────────────
+Live camera + TensorFlow.js COCO-SSD             app.py
+  • moving boxes for people and things   ──────▶   • Gemini look-ins → in hand / on table / where
+  • notices "picked up / put down"   still photo   • Last seen · What happened · Right now
+Reminder alerts (chime + voice + notification)     • Ask Rewind (Gemini) → spoken answer (gTTS)
+                                       ◀──────   reminders.py → pills, appointments, alerts
+                                       schedule    caregiver_profile.json (family settings)
 ```
 
-Optional settings (secrets.toml or env vars): `GEMINI_MODEL` (default `gemini-3.8-flash`), `REWIND_TIMEZONE` (default `America/New_York`).
-Cloud workspaces run in UTC, so the timezone setting keeps the clock right for the person using the app.
+## 💛 Designed for dementia
+- Large text, plain words, one action per button, and a big clock with the day and date.
+- A warm, low-glare background with high-contrast text.
+- Only two box colours that stay distinct for older eyes: **terracotta = people**, **teal = things**. No red, so nothing feels like an alarm.
+- Nothing flashes: boxes fade in gently and only after the item has been seen steadily for a moment.
+- Reassurance first: *"Good evening, Eleanor. You are safe. You are at home."*
+- Answers say the place first, then the time, and never blame the person.
 
-## Entire
-Entire is enabled in this repo (`.entire/`, plus hooks in `.claude/` and `.agents/`). Each AI coding session is saved as a checkpoint
-when you commit, so judges can see how Rewind was built: `entire status`, then commit and push as usual.
+## ▶️ Run it
 
-## Demo script (60 seconds)
-1. Press **Start camera**. Walk in and you'll see the orange box and hear "Person".
-2. Pick up a water bottle: **"Bottle · in hand"**.
-3. Put it on the counter and step away. After 3 seconds, LAST SEEN shows *"Bottle: on the kitchen counter…"*.
-4. Press **Where is my bottle?**: you hear *"Your bottle is on the kitchen counter, next to the sink. You put it there at 2:14 PM."*
-5. Press **Look closely** to find keys or glasses.
+### In Coder (how we built it)
+1. Create a workspace from this repo (`.devcontainer/` is included).
+2. `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
+3. `echo 'GEMINI_API_KEY = "YOUR_KEY"' > .streamlit/secrets.toml` (get a free key at [aistudio.google.com](https://aistudio.google.com))
+4. `streamlit run app.py`, then open port **8501** from the Coder dashboard (https, so the camera works).
+
+Optional settings in `secrets.toml`: `GEMINI_MODEL` (first model to try), `REWIND_TIMEZONE` (default `America/New_York`), `REWIND_LOOK_EVERY_S` (heartbeat, default 25).
+
+## 📁 Files
+- `app.py`: the app, including every Gemini call
+- `reminders.py`: pills, appointments, alerts and the backup reminder parser
+- `components/live_camera/`: the on-device live camera, tracker and overlay
+- `components/alerts/`: the reminder banner with chime, voice and notifications
+- `caregiver_profile.json`: name, family contact, pill times and reminders (sample data)

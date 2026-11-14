@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Rewind reminders</title>
+<style>
+  /* Calm, unmissable reminder banner: warm amber (attention without alarm), very large text, two clear choices. */
+  :root { --ink: #18222F; --muted: #4A5868; --teal: #0F5E6B; --amber: #B7791F; --amber-bg: #FFF6E5; --line: #D8D1C5; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--ink);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; background: #FFFFFF;
+    border: 2px solid var(--line); border-radius: 14px; padding: 10px 16px; font-size: 18px; }
+  .bar .next { flex: 1 1 260px; }
+  button { font: inherit; font-weight: 700; border-radius: 12px; padding: 12px 18px; cursor: pointer; min-height: 52px; }
+  .soft { background: #fff; color: var(--teal); border: 2px solid var(--teal); font-size: 17px; }
+  .alert { display: none; background: var(--amber-bg); border: 3px solid var(--amber); border-left: 14px solid var(--amber);
+    border-radius: 18px; padding: 20px 24px; margin-bottom: 10px; box-shadow: 0 6px 22px rgba(183,121,31,0.18); }
+  .alert.show { display: block; animation: in .6s ease-out; }
+  @keyframes in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+  .alert .icon { font-size: 44px; line-height: 1; margin-right: 10px; }
+  .alert .head { display: flex; align-items: center; }
+  .alert .title { font-size: 32px; font-weight: 800; line-height: 1.2; }
+  .alert .msg { font-size: 24px; line-height: 1.45; margin: 12px 0 16px; }
+  .alert .now { font-size: 18px; color: var(--muted); }
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; }
+  .done { background: var(--teal); color: #fff; border: none; font-size: 24px; padding: 16px 28px; flex: 1 1 240px; }
+  .later { background: #fff; color: var(--ink); border: 2px solid var(--line); font-size: 20px; flex: 0 1 260px; }
+  button:focus-visible { outline: 4px solid #E0A458; outline-offset: 2px; }
+</style>
+</head>
+<body>
+  <div id="alert" class="alert" role="alertdialog" aria-live="assertive">
+    <div class="head"><span id="aIcon" class="icon">🔔</span><span id="aTitle" class="title"></span></div>
+    <div id="aMsg" class="msg"></div>
+    <div class="actions">
+      <button id="doneBtn" class="done">✅ Done</button>
+      <button id="laterBtn" class="later">⏰ Remind me in 10 minutes</button>
+    </div>
+    <div id="aNow" class="now" style="margin-top:10px"></div>
+  </div>
+  <div class="bar">
+    <span class="next" id="next">🔔 Reminders are on.</span>
+    <button id="soundBtn" class="soft">🔊 Tap once to turn on spoken reminders</button>
+  </div>
+
+<script>
+(() => {
+  "use strict";
+  const ST = {
+    send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*"); },
+    ready() { this.send("streamlit:componentReady", { apiVersion: 1 }); },
+    height(h) { this.send("streamlit:setFrameHeight", { height: Math.ceil(h) }); },
+    value(v) { this.send("streamlit:setComponentValue", { value: v, dataType: "json" }); },
+  };
+
+  let alerts = [];          // [{key, rid, kind, title, message, due_ms, final}]
+  let showing = null;
+  let soundOn = false;
+  let actions = [];         // sent back to Python
+  let actionSeq = Date.now();
+  const ICON = { medicine: "💊", appointment: "🩺", visit: "🤗", task: "📝", other: "🔔" };
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+  const handled = (a) => store.get("rewind:handled:" + a.key) === "1";
+  const snoozedUntil = (a) => Number(store.get("rewind:snooze:" + a.key) || 0);
+  const fmt = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (d && d.type === "streamlit:render") {
+      alerts = (d.args && d.args.alerts) || [];
+      const ack = Number((d.args && d.args.ack) || 0);
+      if (ack) actions = actions.filter((a) => a.id > ack);
+      tick();
+    }
+  });
+
+  function chime() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      [523.25, 659.25, 783.99].forEach((f, i) => {  // soft C-E-G
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.35);
+        g.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + i * 0.35 + 0.05);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.35 + 0.9);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(ctx.currentTime + i * 0.35); o.stop(ctx.currentTime + i * 0.35 + 1);
+      });
+    } catch (e) {}
+  }
+  function speak(text) {
+    if (!soundOn || !("speechSynthesis" in window)) return;
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.85;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  }
+  function notify(a) {
+    try {
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("Rewind: " + a.title, { body: a.message, requireInteraction: true });
+      }
+    } catch (e) {}
+    try { window.parent.document.title = "🔔 " + a.title; } catch (e) {}
+  }
+
+  let lastSpokenAt = 0, repeats = 0;
+  function show(a) {
+    showing = a;
+    document.getElementById("aIcon").textContent = ICON[a.kind] || "🔔";
+    document.getElementById("aTitle").textContent = a.title;
+    document.getElementById("aMsg").textContent = a.message;
+    document.getElementById("aNow").textContent = "It is " + fmt(Date.now()) + ".";
+    document.getElementById("doneBtn").textContent = a.kind === "medicine" ? "✅ I took them" : "✅ Done";
+    document.getElementById("alert").classList.add("show");
+    chime(); setTimeout(() => speak(a.message), 1200);
+    notify(a);
+    lastSpokenAt = Date.now(); repeats = 0;
+    resize();
+  }
+  function hide() {
+    showing = null;
+    document.getElementById("alert").classList.remove("show");
+    try { window.parent.document.title = "Rewind — Live Spatial Memory Companion"; } catch (e) {}
+    resize();
+  }
+
+  function tick() {
+    const now = Date.now();
+    const due = alerts.filter((a) => a.due_ms <= now && now - a.due_ms < 3 * 3600 * 1000 && !handled(a) && snoozedUntil(a) <= now);
+    if (showing) {
+      // gentle repeat every 3 minutes, at most twice
+      if (repeats < 2 && now - lastSpokenAt > 180000) { repeats += 1; lastSpokenAt = now; chime(); setTimeout(() => speak(showing.message), 1200); }
+    } else if (due.length) {
+      show(due[0]);
+    }
+    const nxt = alerts.find((a) => a.due_ms > now && !handled(a));
+    document.getElementById("next").textContent = nxt
+      ? `🔔 Next reminder: ${nxt.title} at ${fmt(nxt.due_ms)}.`
+      : "🔔 Reminders are on. Nothing else today.";
+    resize();
+  }
+  setInterval(tick, 5000);
+
+  document.getElementById("doneBtn").addEventListener("click", () => {
+    if (!showing) return;
+    store.set("rewind:handled:" + showing.key, "1");
+    actions.push({ id: ++actionSeq, action: "done", alert: showing });
+    ST.value({ actions });
+    speak(showing.kind === "medicine" ? "Thank you. I've written that down." : "Okay. Well done.");
+    hide(); setTimeout(tick, 400);
+  });
+  document.getElementById("laterBtn").addEventListener("click", () => {
+    if (!showing) return;
+    store.set("rewind:snooze:" + showing.key, String(Date.now() + 10 * 60 * 1000));
+    speak("Okay. I'll remind you again in ten minutes.");
+    hide(); setTimeout(tick, 400);
+  });
+  document.getElementById("soundBtn").addEventListener("click", async () => {
+    soundOn = true;
+    try { if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission(); } catch (e) {}
+    const b = document.getElementById("soundBtn");
+    b.textContent = "🔊 Spoken reminders: ON";
+    b.disabled = true;
+    speak("Spoken reminders are on.");
+  });
+
+  function resize() { ST.height(document.body.scrollHeight + 4); }
+  new ResizeObserver(resize).observe(document.body);
+  ST.ready(); resize();
+})();
+</script>
+</body>
+</html>

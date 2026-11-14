@@ -1,5 +1,6 @@
 import base64
 import html
+import re
 import os
 import time
 from datetime import datetime
@@ -17,6 +18,8 @@ from google import genai
 from google.genai import types
 from gtts import gTTS
 
+import reminders as R
+
 # -----------------------------------------------------------------------------
 # 0. CONFIG (secrets.toml or environment variables — works locally and in Coder)
 # -----------------------------------------------------------------------------
@@ -29,11 +32,18 @@ def _setting(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 
 GEMINI_API_KEY = _setting("GEMINI_API_KEY")
-GEMINI_MODEL = _setting("GEMINI_MODEL", "gemini-3.8-flash")
+# Free tier: Flash-Lite models allow ~500 requests/day each; 3.8 Flash only ~20/day.
+# Each model has its own daily quota, so we try them in order and skip any that are used up.
+GEMINI_MODEL = _setting("GEMINI_MODEL", "gemini-3.5-flash-lite")
+MODEL_CHAIN = list(dict.fromkeys(
+    [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"]
+))
 # Cloud workspaces (Coder) usually run in UTC. A person with dementia must see THEIR clock time.
 LOCAL_TZ = ZoneInfo(_setting("REWIND_TIMEZONE", "America/New_York"))
 GEMINI_MIN_GAP_S = 3.0  # never call Gemini for automatic look-ins more often than this
-AUTO_LOOK_EVERY_S = float(_setting("REWIND_LOOK_EVERY_S", "8"))  # how often the camera asks Gemini to look
+# The camera asks Gemini to look when something changes (item appears / is picked up / put down),
+# plus a slow "heartbeat" look. This keeps us well inside free-tier limits.
+AUTO_LOOK_EVERY_S = float(_setting("REWIND_LOOK_EVERY_S", "25"))
 
 
 def now_local() -> datetime:
@@ -76,6 +86,22 @@ st.markdown("""
         align-items: center; flex-wrap: wrap; gap: 12px;
     }
     .clock-big { font-size: 26px !important; font-weight: 700 !important; }
+    .greet { font-size: 40px !important; font-weight: 800 !important; line-height: 1.15 !important; margin: 0 !important; }
+    .reassure { font-size: 24px !important; line-height: 1.45 !important; margin: 8px 0 6px 0 !important; color: #23403F !important; }
+    .rem-chip { background: #F2EFE9; border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; font-size: 18px !important; line-height: 1.4; }
+    .rem-chip.taken { background: #E4F0EE; border-left: 6px solid #2E7D6B; }
+    .rem-chip.due { background: #FFF6E5; border-left: 6px solid #B7791F; }
+    .rem-chip.later { border-left: 6px solid #C9C0B1; }
+    .rem-chip.event { border-left: 6px solid #0F5E6B; }
+    .pill-line { font-size: 21px !important; font-weight: 600 !important; line-height: 1.45 !important; margin: 0 0 10px 0 !important; }
+    /* Big, warm call button */
+    [data-testid="stLinkButton"] a {
+        background: #A8471A !important; color: #FFFFFF !important; border: none !important; border-radius: 16px !important;
+        font-size: 24px !important; font-weight: 800 !important; padding: 18px 20px !important; width: 100% !important;
+        justify-content: center !important; min-height: 70px;
+    }
+    [data-testid="stLinkButton"] a * { color: #FFFFFF !important; font-size: 24px !important; }
+    [data-testid="stLinkButton"] a:hover { background: #8C3A14 !important; }
     .status-pill {
         display: inline-block; background-color: #E4F0EE; color: #174E4F !important;
         border: 1.5px solid #9EC4C1; font-size: 15px !important; font-weight: 700 !important;
@@ -135,6 +161,18 @@ live_camera = components.declare_component(
     path=str(Path(__file__).parent / "components" / "live_camera"),
 )
 
+# Reminder alerts (banner + chime + voice + desktop notification)
+reminder_alerts = components.declare_component(
+    "rewind_alerts",
+    path=str(Path(__file__).parent / "components" / "alerts"),
+)
+
+# Family settings, pills and reminders (saved in caregiver_profile.json)
+profile = R.load_profile(LOCAL_TZ)
+PATIENT = profile["patient_name"]
+RELATIVE = profile["caregiver_name"].split(" (")[0]
+RELATIONSHIP = (re.search(r"\(([^)]+)\)", profile["caregiver_name"]) or [None, ""])[1]
+
 # -----------------------------------------------------------------------------
 # 2. SESSION MEMORY STATE (IN-MEMORY ONLY — PRIVACY FIRST)
 # -----------------------------------------------------------------------------
@@ -164,12 +202,24 @@ for k, v in defaults.items():
 # -----------------------------------------------------------------------------
 # 3. GEMINI SCHEMAS + HELPERS
 # -----------------------------------------------------------------------------
+class ParsedReminder(BaseModel):
+    title: str                      # short: "Doctor's appointment with Dr. Lee"
+    kind: Literal["appointment", "medicine", "visit", "task", "other"]
+    date: str                       # YYYY-MM-DD
+    time: str                       # HH:MM, 24-hour
+    repeat: Literal["none", "daily", "weekly"]
+    remind_before_minutes: int      # extra early alert (e.g. 60 for appointments), 0 for none
+    spoken_message: str             # warm sentence read aloud when it's time
+    confirmation: str               # "Okay. I'll remind you on Monday at 3 PM about ..."
+
+
 State = Literal["in someone's hand", "on a surface", "being worn", "on the floor", "other"]
 
 
 class SeenObject(BaseModel):
     label: str          # simple 1-2 word lowercase noun: "water bottle", "glasses", "keys"
     state: State        # in hand vs on a table etc.
+    short_place: str    # 2-4 words for the on-screen label: "on the couch", "in right hand", "on the table"
     where_it_is: str    # "on the wooden kitchen table, next to the fruit bowl"
     box_2d: list[int]   # [ymin, xmin, ymax, xmax] normalized 0-1000
 
@@ -200,6 +250,42 @@ def set_error(msg: str | None):
     st.session_state.last_error = msg
 
 
+def gemini(contents, config=None):
+    """Call Gemini, moving to the next model if one is out of quota or unavailable."""
+    dead = st.session_state.setdefault("dead_models", {})
+    last_exc = None
+    for model in MODEL_CHAIN:
+        if dead.get(model, 0) > time.time():
+            continue
+        try:
+            res = client.models.generate_content(model=model, contents=contents, config=config)
+            st.session_state.active_model = model
+            return res
+        except Exception as e:
+            msg = str(e)
+            last_exc = e
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                # per-day limit -> skip for 1 hour; per-minute limit -> skip for 60 s
+                dead[model] = time.time() + (3600 if "per day" in msg.lower() or "PerDay" in msg else 60)
+                continue
+            if "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower():
+                dead[model] = time.time() + 24 * 3600
+                continue
+            raise
+    raise last_exc or RuntimeError("No Gemini model available")
+
+
+def friendly_error(prefix: str, e: Exception) -> str:
+    msg = str(e)
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return (f"{prefix}: every Gemini model is out of free requests right now. "
+                "Wait a minute (or until tomorrow for daily limits), use a new API key from a different Google "
+                "project, or turn on billing in Google AI Studio.")
+    if "401" in msg or "403" in msg or "API key" in msg or "UNAUTHENTICATED" in msg:
+        return f"{prefix}: the API key was rejected. Make a new key at aistudio.google.com. ({msg[:200]})"
+    return f"{prefix}: {type(e).__name__}: {msg[:400]}"
+
+
 def data_url_to_image(data_url: str) -> Image.Image | None:
     try:
         b64 = data_url.split(",", 1)[1]
@@ -219,18 +305,18 @@ def look_at_scene(img: Image.Image, room: str) -> SceneAnalysis:
         "- label: simple 1-2 word lowercase name (e.g. 'water bottle', 'glasses', 'keys', 'phone', 'person')\n"
         "- state: exactly one of \"in someone's hand\", \"on a surface\", \"being worn\", \"on the floor\", \"other\". "
         "Use \"in someone's hand\" ONLY if fingers are clearly wrapped around it. Glasses on a face are \"being worn\".\n"
+        "- short_place: 2-4 words for an on-screen label, naming the furniture or body part: "
+        "'on the couch', 'on the table', 'on the counter', 'in right hand', 'on the floor', 'on her face'. "
+        "For a person say where they are: 'sitting on the couch', 'standing by the door'.\n"
         "- where_it_is: under 12 words using landmarks a person would recognise, e.g. 'on the wooden table, next to the lamp'. "
         "For held items say who/where, e.g. 'in the person's right hand, by the sofa'.\n"
+        "Be careful: do not guess. Glasses are not a remote; only say 'cat' or 'dog' if an animal is clearly visible.\n"
         "- box_2d: [ymin, xmin, ymax, xmax] scaled 0 to 1000.\n"
         "Only include items you are reasonably sure about. Set people_count, and scene_summary to one short calm sentence."
     )
-    res = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[img, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=SceneAnalysis,
-        ),
+    res = gemini(
+        [img, prompt],
+        types.GenerateContentConfig(response_mime_type="application/json", response_schema=SceneAnalysis),
     )
     if res.parsed is None:
         raise RuntimeError(f"Gemini returned no structured result: {res.text[:200] if res.text else 'empty'}")
@@ -267,6 +353,11 @@ def log_event(text: str, time_label: str | None = None):
 
 def apply_scene(scene: SceneAnalysis, room: str, time_label: str):
     """Update LAST SEEN + WHAT HAPPENED from a Gemini look, logging only real changes."""
+    people = [o for o in scene.objects if o.label.strip().lower() in PERSON_WORDS]
+    people_now = ", ".join(f"someone {o.short_place}" for o in people) if people else ""
+    if people_now and people_now != st.session_state.get("people_now"):
+        log_event(f"{people_now[:1].upper() + people_now[1:]} ({room})", time_label)
+    st.session_state.people_now = people_now
     for obj in scene.objects:
         name = obj.label.strip().lower()
         if not name or name in PERSON_WORDS:
@@ -314,8 +405,7 @@ def draw_boxes(image: Image.Image, objects: list[SeenObject]) -> Image.Image:
                 ((x2, y2), (x2 - corner, y2)), ((x2, y2), (x2, y2 - corner)),
             ]:
                 draw.line([(ax, ay), (bx, by)], fill=color, width=width)
-        short = {"in someone's hand": " · in hand", "on a surface": " · on a surface",
-                 "being worn": " · being worn", "on the floor": " · on the floor"}.get(obj.state, "")
+        short = f" · {obj.short_place}" if obj.short_place else ""
         label_text = f" {obj.label.capitalize()}{short} "
         bbox = draw.textbbox((0, 0), label_text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -370,7 +460,8 @@ def process_camera_events(payload: dict | None, room: str):
                         scene = look_at_scene(img, ev_room)
                         st.session_state.latest_scene = scene.scene_summary
                         st.session_state.gemini_objs = [
-                            {"label": o.label, "state": o.state, "where": o.where_it_is, "box": o.box_2d}
+                            {"label": o.label, "state": o.state, "place": o.short_place,
+                             "where": o.where_it_is, "box": o.box_2d}
                             for o in scene.objects
                         ]
                         st.session_state.gemini_id = ev_id
@@ -379,12 +470,82 @@ def process_camera_events(payload: dict | None, room: str):
                             st.session_state.annotated_img = draw_boxes(img, scene.objects)
                         set_error(None)
                     except Exception as e:
-                        set_error(f"Gemini look-in failed: {type(e).__name__}: {e}")
+                        set_error(friendly_error("Gemini look-in failed", e))
                         print("Gemini look-in failed:", repr(e))
 
         # mark done right away so a rerun can't repeat it
         st.session_state.processed_ids.add(ev_id)
         st.session_state.ack = max(st.session_state.ack, ev_id)
+
+
+def parse_reminder(text: str) -> dict:
+    """Turn 'dentist with Dr. Lee next Tuesday at 2' into a real timed reminder (Gemini, with a simple backup)."""
+    now = now_local()
+    prompt = (
+        f"Right now it is {now.strftime('%A, %B %d, %Y, %I:%M %p')} ({LOCAL_TZ.key}).\n"
+        f"A caregiver or a person living with dementia ({PATIENT}) wants a reminder: \"{text}\"\n"
+        "Turn it into a reminder. Rules: pick the next matching date in the future; if no time is given choose a sensible "
+        "one (morning tasks 09:00, appointments 10:00); appointments get remind_before_minutes=60 (or 120 if travel is "
+        "mentioned); medicine taken every day => kind 'medicine' and repeat 'daily'. "
+        f"spoken_message: one warm, simple sentence spoken to {PATIENT} at that moment, e.g. "
+        "'It's time for your dentist appointment with Dr. Lee. Your coat is by the door.' "
+        "confirmation: one short sentence confirming when you'll remind them, using the weekday and a 12-hour time."
+    )
+    try:
+        res = gemini(prompt, types.GenerateContentConfig(response_mime_type="application/json",
+                                                         response_schema=ParsedReminder))
+        r = res.parsed
+        datetime.strptime(r.date, "%Y-%m-%d")
+        datetime.strptime(r.time, "%H:%M")
+        return {"title": r.title, "message": r.spoken_message, "kind": r.kind, "date": r.date, "time": r.time,
+                "repeat": r.repeat, "remind_before_minutes": max(0, r.remind_before_minutes),
+                "confirmation": r.confirmation}
+    except Exception as e:
+        print("Gemini reminder parse failed, using simple parser:", repr(e))
+        parsed = R.simple_parse(text, now)
+        if parsed is None:
+            raise ValueError("no time found")
+        return parsed
+
+
+def say(text: str) -> bytes | None:
+    try:
+        buf = BytesIO()
+        gTTS(text, lang="en", slow=False).write_to_fp(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def schedule_lines() -> list[str]:
+    now = now_local()
+    lines = ["PILLS TODAY: " + R.pills_sentence(R.med_status(profile, now))]
+    for u in R.upcoming(profile, now, LOCAL_TZ, days=14)[:6]:
+        lines.append(f"- {u['title']}: {R.when_words(u['at'], now)}")
+    return lines
+
+
+def answer_from_notes(question: str) -> str:
+    """Simple answer straight from LAST SEEN — works even when Gemini is unavailable."""
+    q = question.lower()
+    if re.search(r"pill|medic|tablet", q):
+        return R.pills_sentence(R.med_status(profile, now_local()))
+    if re.search(r"appointment|doctor|today|tomorrow|next|plan|schedule", q):
+        ups = R.upcoming(profile, now_local(), LOCAL_TZ, days=14)
+        if ups:
+            u = ups[0]
+            return f"Next is {u['title'].lower()}, {R.when_words(u['at'], now_local())}."
+        return "There is nothing else planned. You can rest."
+    if "who" in q:
+        people = [e for e in st.session_state.what_happened if "someone" in e["event"].lower()]
+        if people:
+            return f"{people[0]['event']} at {people[0]['time']}."
+        return "I haven't seen anyone yet."
+    for e in st.session_state.last_seen:
+        name = e["item"].lower()
+        if name in q or canon(name) in q or any(w in q for w in canon(name).split()):
+            return f"Your {name} was {e['where']}, in the {e['room'].lower()}, at {e['time']}."
+    return "I haven't seen that yet. Let's show the camera around the room together."
 
 
 def answer_spatial_question(question: str):
@@ -393,8 +554,8 @@ def answer_spatial_question(question: str):
         and st.session_state.camera_on
         and time.time() - st.session_state.latest_frame_at < 60
     )
-    if not st.session_state.last_seen and not frame_fresh:
-        ans = "I haven't seen anything yet. Turn on the camera and show me around the room."
+    if False:
+        pass
     else:
         seen_lines = [
             f"- {x['item']}: {x['where']} ({x['state'] or 'state unknown'}), {x['room']}, last seen {x['time']}"
@@ -408,45 +569,82 @@ def answer_spatial_question(question: str):
             + "If it is not visible now, use the notes below and say where and when it was last seen.\n"
             "Reply in 1-2 short, warm, simple sentences. Say the place first, then the time. "
             "Never blame or correct the person. If you truly don't know, say so gently and suggest showing the camera around.\n\n"
-            f"CURRENT TIME: {clock()}\n\n"
+            f"CURRENT TIME: {now_local().strftime('%A')} {clock()}\n"
+            f"PERSON'S NAME: {PATIENT}. FAMILY: {RELATIVE} ({RELATIONSHIP}).\n\n"
+            "REMINDERS AND PILLS:\n" + "\n".join(schedule_lines()) + "\n\n"
             f"LAST SEEN ITEMS:\n{chr(10).join(seen_lines) if seen_lines else 'None yet'}\n\n"
             f"WHAT HAPPENED:\n{chr(10).join(event_lines)}\n\n"
             f"QUESTION: {question}"
         )
         contents = [st.session_state.latest_frame, prompt] if frame_fresh else prompt
         try:
-            res = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
-            ans = (res.text or "").strip() or "I'm not sure right now. Let's look around the room together."
+            res = gemini(contents)
+            ans = (res.text or "").strip() or answer_from_notes(question)
             set_error(None)
         except Exception as e:
-            set_error(f"Gemini answer failed: {type(e).__name__}: {e}")
+            set_error(friendly_error("Gemini answer failed", e))
             print("Gemini answer failed:", repr(e))
-            ans = "I'm having trouble thinking right now. Please try again in a moment."
+            ans = answer_from_notes(question)
 
     st.session_state.last_answer = ans
-    try:
-        buf = BytesIO()
-        gTTS(ans, lang="en", slow=False).write_to_fp(buf)
-        st.session_state.last_audio = buf.getvalue()
-    except Exception:
-        st.session_state.last_audio = None
+    st.session_state.last_audio = say(ans)
 
 
 # -----------------------------------------------------------------------------
 # 4. TOP HEADER
 # -----------------------------------------------------------------------------
-st.markdown(f"""
-<div class="top-header">
-    <div>
-        <h1 style="margin:0; font-size:30px !important;">🧭 REWIND LIVE</h1>
-        <p class="clock-big" style="margin:4px 0 0 0;">{now_local().strftime("%A, %B ")}{now_local().day} &nbsp;•&nbsp; {clock()}</p>
+# Handle "Done" presses from reminder alerts before drawing anything
+for act in (st.session_state.get("rem_alerts") or {}).get("actions", []):
+    if act.get("id", 0) <= st.session_state.get("alerts_ack", 0):
+        continue
+    if act.get("action") == "done" and act.get("alert"):
+        R.complete_alert(profile, act["alert"], now_local())
+        log_event(f"Reminder done: {act['alert'].get('title', '')}")
+    st.session_state.alerts_ack = act["id"]
+
+_now = now_local()
+part_of_day = "morning" if _now.hour < 12 else ("afternoon" if _now.hour < 17 else "evening")
+visit_today = next((u for u in R.upcoming(profile, _now, LOCAL_TZ, days=1)
+                    if u.get("kind") == "visit" and u["at"].date() == _now.date() and u["at"] > _now), None)
+reassure = profile.get("home_note") or "You are safe. You are at home."
+if visit_today:
+    reassure += f" {RELATIVE} is coming to see you at {R.nice_time(visit_today['at'])}."
+greeting = f"Good {part_of_day}, {PATIENT}."
+
+h_left, h_right = st.columns([2.6, 1], gap="medium")
+with h_left:
+    st.markdown(f"""
+    <div class="top-header" style="display:block;">
+        <p class="greet">👋 {html.escape(greeting)}</p>
+        <p class="reassure">{html.escape(reassure)}</p>
+        <p class="clock-big" style="margin:4px 0 0 0;">It is {_now.strftime("%A, %B ")}{_now.day} &nbsp;•&nbsp; {clock()}</p>
+        <div style="margin-top:10px;">
+            <span class="status-pill" style="margin-left:0;">🧭 REWIND LIVE</span>
+            <span class="status-pill">{html.escape(st.session_state.get("active_model", GEMINI_MODEL).upper())}</span>
+        </div>
     </div>
-    <div>
-        <span class="status-pill">● LIVE DETECTION ON THIS DEVICE</span>
-        <span class="status-pill">{html.escape(GEMINI_MODEL.upper())}</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+with h_right:
+    phone = profile.get("caregiver_phone", "")
+    digits = re.sub(r"[^\d+]", "", phone)
+    if digits and not digits.startswith("+") and len(digits) == 10:
+        digits = "+1" + digits
+    st.link_button(f"📞 Call {RELATIVE}", f"tel:{digits}", width="stretch")
+    st.markdown(f"<p style='text-align:center; font-size:20px !important; margin:6px 0 10px 0;'>"
+                f"{html.escape(RELATIVE)}{' · ' + html.escape(RELATIONSHIP) if RELATIONSHIP else ''}<br/>"
+                f"<strong>{html.escape(phone)}</strong></p>", unsafe_allow_html=True)
+    if st.button("🔊 Say hello", width="stretch"):
+        st.session_state.hello_audio = say(f"{greeting} {reassure} It is {_now.strftime('%A')}, {clock()}.")
+    if st.session_state.get("hello_audio"):
+        st.audio(st.session_state.hello_audio, format="audio/mp3", autoplay=True)
+
+# Reminder alerts appear here, big, when something is due
+reminder_alerts(
+    alerts=R.alert_schedule(profile, _now, LOCAL_TZ),
+    ack=st.session_state.get("alerts_ack", 0),
+    key="rem_alerts",
+    default=None,
+)
 
 # -----------------------------------------------------------------------------
 # 5. MAIN TWO-COLUMN: LIVE CAMERA + MEMORY
@@ -484,26 +682,86 @@ with left_col:
                     apply_scene(scene, current_room, clock())
                     set_error(None)
                 except Exception as e:
-                    set_error(f"Gemini photo look failed: {type(e).__name__}: {e}")
+                    set_error(friendly_error("Gemini photo look failed", e))
 
     if st.session_state.annotated_img is not None:
         st.image(st.session_state.annotated_img, caption=f"Gemini's closer look — {current_room}", width="stretch")
 
 with right_col:
+    # TODAY'S REMINDERS
+    with st.container(border=True):
+        st.markdown("<p class='panel-title'>💊 PILLS TODAY</p>", unsafe_allow_html=True)
+        meds = R.med_status(profile, _now)
+        st.markdown(f"<p class='pill-line'>{html.escape(R.pills_sentence(meds))}</p>", unsafe_allow_html=True)
+        for m in meds:
+            if m["state"] == "taken":
+                st.markdown(f"<div class='rem-chip taken'>✅ <strong>{html.escape(m['name'])}</strong> — taken at {m['taken_at']}</div>",
+                            unsafe_allow_html=True)
+            else:
+                label = {"due": "it's time now", "missed": "not taken yet", "later": "later"}[m["state"]]
+                cls = "due" if m["state"] in ("due", "missed") else "later"
+                st.markdown(f"<div class='rem-chip {cls}'>⏳ <strong>{html.escape(m['name'])}</strong> · "
+                            f"{R.nice_time(m['due'])} — {label}</div>", unsafe_allow_html=True)
+                if m["state"] in ("due", "missed"):
+                    if st.button(f"✅ I took my {m['name'].lower()}", key=f"took_{m['id']}"):
+                        R.mark_taken(profile, m["id"], now_local())
+                        log_event(f"{m['name']} taken")
+                        st.rerun()
+
+        st.markdown("<p class='panel-title' style='margin-top:14px !important;'>📅 COMING UP</p>", unsafe_allow_html=True)
+        ups = R.upcoming(profile, _now, LOCAL_TZ, days=30)[:5]
+        icons = {"appointment": "🩺", "visit": "🤗", "medicine": "💊", "task": "📝", "other": "🔔"}
+        if ups:
+            for u in ups:
+                st.markdown(f"<div class='rem-chip event'>{icons.get(u.get('kind'), '🔔')} <strong>{html.escape(u['title'])}</strong>"
+                            f"<br/>{html.escape(R.when_words(u['at'], _now))}</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='rem-chip'>Nothing planned. You can rest.</div>", unsafe_allow_html=True)
+
+        with st.form("add_reminder", clear_on_submit=True, border=False):
+            new_rem = st.text_input("➕ Add a reminder in your own words",
+                                    placeholder="e.g. Dentist with Dr. Lee next Tuesday at 2pm")
+            add_pressed = st.form_submit_button("Add reminder", width="stretch")
+        if add_pressed and new_rem.strip():
+            with st.spinner("Setting up your reminder…"):
+                try:
+                    parsed = parse_reminder(new_rem.strip())
+                    R.add_reminder(profile, title=parsed["title"], message=parsed["message"], kind=parsed["kind"],
+                                   day=parsed["date"], time_hm=parsed["time"], repeat=parsed["repeat"],
+                                   remind_before_minutes=parsed["remind_before_minutes"])
+                    st.session_state.reminder_msg = ("ok", parsed["confirmation"])
+                    st.session_state.reminder_audio = say(parsed["confirmation"])
+                    log_event(f"New reminder: {parsed['title']}")
+                except Exception:
+                    st.session_state.reminder_msg = ("err", "I couldn't tell when. Try adding a day and time, "
+                                                            "like “tomorrow at 3pm”.")
+            st.rerun()
+        if st.session_state.get("reminder_msg"):
+            kind_, msg_ = st.session_state.reminder_msg
+            (st.success if kind_ == "ok" else st.warning)(msg_)
+        if st.session_state.get("reminder_audio"):
+            st.audio(st.session_state.reminder_audio, format="audio/mp3", autoplay=True)
+
     # RIGHT NOW
     if st.session_state.camera_on:
-        chips = "".join(
-            f"<span class='now-chip {'person' if v['label'] == 'Person' else ''}'>"
-            f"{html.escape(v['label'])}{' · in hand' if v.get('held') else ''}</span>"
-            for v in st.session_state.visible_now
-        )
+        gem_by_kind = {canon(g["label"]): g for g in st.session_state.gemini_objs if g["label"].lower() not in PERSON_WORDS}
+
+        def live_chip(v):
+            g = gem_by_kind.get(canon(v["label"]))
+            name = g["label"].capitalize() if g else v["label"]
+            place = (g.get("place") if g else "") or ("in hand" if v.get("held") else "")
+            cls = "person" if v["label"] == "Person" else ""
+            return f"<span class='now-chip {cls}'>{html.escape(name)}{' · ' + html.escape(place) if place else ''}</span>"
+
+        chips = "".join(live_chip(v) for v in st.session_state.visible_now)
+        if st.session_state.get("people_now"):
+            chips = chips.replace(">Person</span>", f">Person · {html.escape(st.session_state.people_now.split(',')[0].replace('someone ', ''))}</span>", 1)
         seen_names = {canon(v["label"]) for v in st.session_state.visible_now}
         for g in st.session_state.gemini_objs:
             if g["label"].lower() in PERSON_WORDS or canon(g["label"]) in seen_names:
                 continue
-            short = {"in someone's hand": " · in hand", "on a surface": " · on a surface",
-                     "being worn": " · being worn", "on the floor": " · on the floor"}.get(g["state"], "")
-            chips += f"<span class='now-chip'>{html.escape(g['label'].capitalize())}{short}</span>"
+            short = f" · {g['place']}" if g.get("place") else ""
+            chips += f"<span class='now-chip'>{html.escape(g['label'].capitalize())}{html.escape(short)}</span>"
         chips = chips or "<p style='margin:0; color:#4A5868 !important;'>Nothing I recognise right now.</p>"
     else:
         chips = "<p style='margin:0; color:#4A5868 !important;'>Camera is off.</p>"
@@ -540,8 +798,9 @@ with right_col:
     <div class="privacy-box">
         <p style="font-size:16px !important; margin:0;">
             <strong>Nothing is saved permanently.</strong> The moving boxes are worked out on this device.
-            Every few seconds one still photo is sent to Gemini to find small things and where they are.
+            When something changes (and every half minute), one still photo is sent to Gemini to find small things and where they are.
             Notes like <em>“Glasses: on the kitchen table, 1:54 PM”</em> are erased when you close this tab.
+            Only reminders and family settings are saved.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -569,9 +828,10 @@ with st.container(border=True):
         with q_col2:
             ask_pressed = st.form_submit_button("🔊 Ask", width="stretch")
 
-    quick = ["Where is my bottle?", "Where are my glasses?", "Where is my phone?", "Who was here?"]
-    for row in (quick[:2], quick[2:]):
-        cols = st.columns(2)
+    quick = ["Where is my bottle?", "Where are my glasses?", "Where is my phone?",
+             "Did I take my pills?", "What's next today?", "Who was here?"]
+    for row in (quick[:3], quick[3:]):
+        cols = st.columns(3)
         for col, q in zip(cols, row):
             with col:
                 if st.button(q, key=f"quick_{q}"):
@@ -592,22 +852,72 @@ with st.container(border=True):
         st.audio(st.session_state.last_audio, format="audio/mp3", autoplay=True)
 
 # -----------------------------------------------------------------------------
-# 7. TEAM-ONLY TROUBLESHOOTING (collapsed so it doesn't distract the user)
+# 7. FAMILY SETTINGS (collapsed)
+# -----------------------------------------------------------------------------
+with st.expander("👪 For family: names, phone number, pills and reminders"):
+    with st.form("family_settings", border=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            f_name = st.text_input("Name of the person using Rewind", profile["patient_name"])
+            f_home = st.text_input("Reassuring words shown at the top", profile.get("home_note", ""))
+        with c2:
+            f_rel = st.text_input("Family member to call (name and relationship)", profile["caregiver_name"],
+                                  help="For example: Sarah (Daughter)")
+            f_phone = st.text_input("Their phone number", profile["caregiver_phone"])
+        st.markdown("**Pill times** (24-hour, like 08:00 or 20:00)")
+        med_cols = st.columns(max(1, len(profile["meds"])))
+        new_times = {}
+        for col, m in zip(med_cols, profile["meds"]):
+            with col:
+                new_times[m["id"]] = st.text_input(m["name"], m["time"], key=f"medtime_{m['id']}")
+        if st.form_submit_button("Save settings"):
+            profile.update(patient_name=f_name.strip() or profile["patient_name"], home_note=f_home.strip(),
+                           caregiver_name=f_rel.strip() or profile["caregiver_name"], caregiver_phone=f_phone.strip())
+            for m in profile["meds"]:
+                t = new_times.get(m["id"], m["time"]).strip()
+                if re.fullmatch(r"\d{1,2}:\d{2}", t):
+                    m["time"] = t.zfill(5)
+            R.save_profile(profile)
+            st.rerun()
+
+    st.markdown("**All reminders** (tap 🗑 to remove)")
+    for r in profile["reminders"] + [dict(m, title=m["name"], repeat="daily", date="", kind="medicine") for m in profile["meds"]]:
+        when = f"every day at {r['time']}" if r.get("repeat") == "daily" else (
+            f"every week, {r['date']} {r['time']}" if r.get("repeat") == "weekly" else f"{r['date']} {r['time']}")
+        cc1, cc2 = st.columns([5, 1])
+        with cc1:
+            st.write(f"{'✔️ ' if r.get('done') else ''}{r['title']} — {when}")
+        with cc2:
+            if st.button("🗑", key=f"del_{r['id']}"):
+                R.delete_reminder(profile, r["id"])
+                st.rerun()
+    taken_today = [m for m in R.med_status(profile, now_local()) if m["state"] == "taken"]
+    for m in taken_today:
+        if st.button(f"Undo: {m['name']} marked as taken", key=f"undo_{m['id']}"):
+            R.undo_taken(profile, m["id"], now_local())
+            st.rerun()
+
+# -----------------------------------------------------------------------------
+# 8. TEAM-ONLY TROUBLESHOOTING (collapsed so it doesn't distract the user)
 # -----------------------------------------------------------------------------
 with st.expander("🛠 For the team: connection check"):
     if st.session_state.last_error:
         st.error(st.session_state.last_error)
     else:
         st.write("No errors so far.")
-    st.caption(f"Model: {GEMINI_MODEL} · Gemini look-in every {AUTO_LOOK_EVERY_S:g}s · "
+    dead = st.session_state.get("dead_models", {})
+    resting = [m for m, until in dead.items() if until > time.time()]
+    st.caption(f"Using: {st.session_state.get('active_model', GEMINI_MODEL)} · Backup order: {', '.join(MODEL_CHAIN)} · "
+               f"Resting (out of quota): {', '.join(resting) or 'none'} · Heartbeat look every {AUTO_LOOK_EVERY_S:g}s · "
                f"Key starts with: {GEMINI_API_KEY[:4]}…")
     if st.button("Test Gemini now"):
         try:
-            r = client.models.generate_content(model=GEMINI_MODEL, contents="Reply with the single word: ready")
-            st.session_state.gemini_test = ("ok", f"Gemini works ✅  (it said: {(r.text or '').strip()[:40]})")
+            r = gemini("Reply with the single word: ready")
+            st.session_state.gemini_test = ("ok", f"Gemini works ✅ using {st.session_state.active_model} "
+                                                  f"(it said: {(r.text or '').strip()[:40]})")
             set_error(None)
         except Exception as e:
-            st.session_state.gemini_test = ("err", f"Gemini failed: {type(e).__name__}: {e}")
+            st.session_state.gemini_test = ("err", friendly_error("Gemini failed", e))
     if st.session_state.get("gemini_test"):
         kind, msg = st.session_state.gemini_test
         (st.success if kind == "ok" else st.error)(msg)

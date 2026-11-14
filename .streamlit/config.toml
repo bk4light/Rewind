@@ -1,7 +1,17 @@
 [theme]
 base = "light"
-primaryColor = "#1E4E68"
-backgroundColor = "#F7F5F0"
+primaryColor = "#0F5E6B"
+backgroundColor = "#F6F3EC"
 secondaryBackgroundColor = "#EBE6DC"
 textColor = "#18222F"
 font = "sans serif"
+
+[server]
+headless = true
+port = 8501
+# Needed so photo upload works behind Coder's port-forwarding proxy
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

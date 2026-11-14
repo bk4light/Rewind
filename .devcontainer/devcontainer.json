@@ -1,0 +1,21 @@
+{
+  "name": "Rewind (Emory Hacks)",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {}
+  },
+  "postCreateCommand": "pip install -r requirements.txt && (curl -fsSL https://entire.io/install.sh | bash || echo 'Entire install skipped')",
+  "forwardPorts": [8501],
+  "appPort": ["8501:8501"],
+  "portsAttributes": {
+    "8501": { "label": "Rewind app", "onAutoForward": "openBrowser" }
+  },
+  "containerEnv": {
+    "REWIND_TIMEZONE": "America/New_York"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
+  }
+}
